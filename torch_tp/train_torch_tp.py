@@ -70,7 +70,8 @@ def train(args):
     rowwise_placement=[Shard(0)]
     mesh = DeviceMesh("cuda", list(range(world_size)))
     sharded_module = distribute_module(mlp(), mesh, partition_fn=shard_fc).to(device)
-    
+    sharded_module = parallelize_module(sharded_module, mesh, PairwiseParallel())
+
     optimizer = Adam(sharded_module.parameters(), lr=args.lr, weight_decay=args.adam_weight_decay)
 
     if args.profile and rank == 0:

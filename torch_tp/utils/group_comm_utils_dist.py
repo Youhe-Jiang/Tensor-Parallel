@@ -38,7 +38,7 @@ def show_groups(groups):
             group.print()
     print()
 
-def gen_tp_group_dist(tp_size, pp_size, to_print = True, consecutive = True):
+def gen_tp_group_dist(tp_size, pp_size, to_print = True, consecutive = True, return_device_mesh = False):
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
     all_tp_groups = []
@@ -67,6 +67,18 @@ def gen_tp_group_dist(tp_size, pp_size, to_print = True, consecutive = True):
     if rank == 0 and to_print:
         print("TP groups:", end = ' ')
         show_groups(all_tp_groups)
+    
+    if return_device_mesh:
+        from torch.distributed._tensor import DeviceMesh
+        device_mesh_list = []
+        for i in range(pp_size):
+            device_mesh_list.append([])
+        for g in all_tp_groups:
+            for i in range(pp_size):
+                if i*num_pp_groups <= g.ranks[0] < (i+1)*num_pp_groups:
+                    device_mesh_list[i].append(g.ranks)
+        device_mesh = DeviceMesh("cuda", device_mesh_list)
+        return tp_group, device_mesh
     return tp_group
 
 def gen_dp_group_dist(tp_size, pp_size, to_print = True, consecutive = False):
@@ -146,12 +158,26 @@ def gen_slice_func_dist(tp_size_old, tp_size_new, tp_consec_old, tp_consec_new, 
         return SliceFunc(slice_num, local_rank)
     return None
 
+def gen_relocation_meshes(tp_size_old, tp_size_new, tp_consec_old, tp_consec_new, device_mesh_old, device_mesh_new):
+    if tp_size_old == tp_size_new and tp_consec_old == tp_consec_new:
+        return (None, None)
+    if tp_size_old == 1:
+        return (None, device_mesh_new)
+    else:
+        return (device_mesh_old, device_mesh_new)
 
-def get_tp_group_dict_dist(all_tp_sizes, pp_size, consecutive = True):
+def get_tp_group_dict_dist(all_tp_sizes, pp_size, consecutive = True, return_device_mesh = False):
     tp_sizes_set = list(set(all_tp_sizes))
     tp_group_dict={}
+    device_mesh_dict={}
     for tp_size in tp_sizes_set:
-        tp_group_dict[tp_size] = gen_tp_group_dist(tp_size, pp_size, to_print=False, consecutive=consecutive)
+        re = gen_tp_group_dist(tp_size, pp_size, to_print=False, consecutive=consecutive, return_device_mesh=return_device_mesh)
+        if return_device_mesh:
+            tp_group_dict[tp_size], device_mesh_dict[tp_size] = re
+        else:
+            tp_group_dict[tp_size] = re
+    if return_device_mesh:
+        return tp_group_dict, device_mesh_dict
     return tp_group_dict
 
 def get_dp_group_dict_dist(all_tp_sizes, pp_size, consecutive = False):
@@ -161,7 +187,7 @@ def get_dp_group_dict_dist(all_tp_sizes, pp_size, consecutive = False):
         dp_group_dict[tp_size] = gen_dp_group_dist(tp_size, pp_size, to_print=False, consecutive=consecutive)
     return dp_group_dict
 
-def gen_groups_dist(all_tp_sizes, pp_size, tp_consecutive_flags, show_rank = -1):
+def gen_groups_dist(all_tp_sizes, pp_size, tp_consecutive_flags, show_rank = -1, use_dtensor = False):
     world_size = torch.distributed.get_world_size()
     world_size_per_stage = world_size // pp_size
     for i in range(len(all_tp_sizes)):
@@ -174,28 +200,89 @@ def gen_groups_dist(all_tp_sizes, pp_size, tp_consecutive_flags, show_rank = -1)
     allgather_groups = [None]
     slice_funcs = [None]
     pp_group = gen_pp_group_dist(pp_size, to_print=False)
-    tp_group_dict_consec = get_tp_group_dict_dist(all_tp_sizes, pp_size, True)
-    tp_group_dict_inconsec = get_tp_group_dict_dist(all_tp_sizes, pp_size, False)
+    if use_dtensor:
+        device_meshes = []
+        tp_group_dict_consec, device_mesh_dict_consec = get_tp_group_dict_dist(all_tp_sizes, pp_size, True, True)
+        tp_group_dict_inconsec, device_mesh_dict_inconsec = get_tp_group_dict_dist(all_tp_sizes, pp_size, False, True)
+    else:
+        tp_group_dict_consec = get_tp_group_dict_dist(all_tp_sizes, pp_size, True)
+        tp_group_dict_inconsec = get_tp_group_dict_dist(all_tp_sizes, pp_size, False)
     dp_group_dict_consec = get_dp_group_dict_dist(all_tp_sizes, pp_size, True)
     dp_group_dict_inconsec = get_dp_group_dict_dist(all_tp_sizes, pp_size, False)
     for i in range(len(all_tp_sizes)):
         if tp_consecutive_flags[i]:
             tp_groups.append(tp_group_dict_consec[all_tp_sizes[i]])
             dp_groups.append(dp_group_dict_inconsec[all_tp_sizes[i]])
+            if use_dtensor:
+                device_meshes.append(device_mesh_dict_consec[all_tp_sizes[i]])
         else:
             tp_groups.append(tp_group_dict_inconsec[all_tp_sizes[i]])
             dp_groups.append(dp_group_dict_consec[all_tp_sizes[i]])
-    for i in range(1, len(all_tp_sizes)):
-        allgather_groups.append(gen_allgather_group_dist(all_tp_sizes[i-1], all_tp_sizes[i], tp_consecutive_flags[i-1], tp_consecutive_flags[i], tp_groups[i], pp_size))
-    for i in range(1, len(all_tp_sizes)):
-        slice_funcs.append(gen_slice_func_dist(all_tp_sizes[i-1], all_tp_sizes[i], tp_consecutive_flags[i-1], tp_consecutive_flags[i], tp_groups[i-1], pp_size))
+            if use_dtensor:
+                device_meshes.append(device_mesh_dict_inconsec[all_tp_sizes[i]])
+    if use_dtensor:
+        for i in range(1, len(all_tp_sizes)):
+            slice_mesh, allgather_mesh = gen_relocation_meshes(all_tp_sizes[i-1], all_tp_sizes[i], tp_consecutive_flags[i-1], tp_consecutive_flags[i], device_meshes[i-1], device_meshes[i])
+            allgather_groups.append(allgather_mesh)
+            slice_funcs.append(slice_mesh)
+    else:
+        for i in range(1, len(all_tp_sizes)):
+            allgather_groups.append(gen_allgather_group_dist(all_tp_sizes[i-1], all_tp_sizes[i], tp_consecutive_flags[i-1], tp_consecutive_flags[i], tp_groups[i], pp_size))
+        for i in range(1, len(all_tp_sizes)):
+            slice_funcs.append(gen_slice_func_dist(all_tp_sizes[i-1], all_tp_sizes[i], tp_consecutive_flags[i-1], tp_consecutive_flags[i], tp_groups[i-1], pp_size))
     if show_rank >= 0 and torch.distributed.get_rank() == show_rank:
-        print("TP groups for rank %d:"%show_rank)
+        print('====================== Galvatron Communication Group ===========================')
+        print("TP groups for rank %d (all layers):"%show_rank)
         show_groups(tp_groups)
-        print("DP groups for rank %d:"%show_rank)
+        print("DP groups for rank %d (all layers):"%show_rank)
         show_groups(dp_groups)
-        print("AllGather groups for rank %d:"%show_rank)
-        show_groups(allgather_groups)
-        print("Slice Funcs for rank %d:"%show_rank)
-        show_groups(slice_funcs)
+        # print("AllGather groups for rank %d:"%show_rank)
+        # show_groups(allgather_groups)
+        # print("Slice Funcs for rank %d:"%show_rank)
+        # show_groups(slice_funcs)
+        print('================================================================================')
     return pp_group, tp_groups, dp_groups, allgather_groups, slice_funcs
+
+# def generate_groups_dist(all_tp_sizes, pp_size, tp_consecutive_flags, show_rank = -1):
+#     world_size = torch.distributed.get_world_size()
+#     world_size_per_stage = world_size // pp_size
+#     for i in range(len(all_tp_sizes)):
+#         tp_consec = tp_consecutive_flags[i]
+#         assert tp_consec == 0 or tp_consec == 1
+#         if all_tp_sizes[i] in [1, world_size_per_stage]:
+#             tp_consecutive_flags[i] = 1
+#     tp_groups = []
+#     dp_groups = []
+#     device_meshes = []
+#     allgather_meshes = [None]
+#     slice_meshes = [None]
+#     pp_group = gen_pp_group_dist(pp_size, to_print=False)
+#     tp_group_dict_consec, device_mesh_dict_consec = get_tp_group_dict_dist(all_tp_sizes, pp_size, True, True)
+#     tp_group_dict_inconsec, device_mesh_dict_inconsec = get_tp_group_dict_dist(all_tp_sizes, pp_size, False, True)
+#     dp_group_dict_consec = get_dp_group_dict_dist(all_tp_sizes, pp_size, True)
+#     dp_group_dict_inconsec = get_dp_group_dict_dist(all_tp_sizes, pp_size, False)
+#     for i in range(len(all_tp_sizes)):
+#         if tp_consecutive_flags[i]:
+#             tp_groups.append(tp_group_dict_consec[all_tp_sizes[i]])
+#             device_meshes.append(device_mesh_dict_consec[all_tp_sizes[i]])
+#             dp_groups.append(dp_group_dict_inconsec[all_tp_sizes[i]])
+#         else:
+#             tp_groups.append(tp_group_dict_inconsec[all_tp_sizes[i]])
+#             device_meshes.append(device_mesh_dict_inconsec[all_tp_sizes[i]])
+#             dp_groups.append(dp_group_dict_consec[all_tp_sizes[i]])
+#     for i in range(1, len(all_tp_sizes)):
+#         slice_mesh, allgather_mesh = gen_relocation_meshes(all_tp_sizes[i-1], all_tp_sizes[i], tp_consecutive_flags[i-1], tp_consecutive_flags[i], device_meshes[i-1], device_meshes[i])
+#         allgather_meshes.append(allgather_mesh)
+#         slice_meshes.append(slice_mesh)
+#     if show_rank >= 0 and torch.distributed.get_rank() == show_rank:
+#         print('====================== Galvatron Communication Group ===========================')
+#         print("TP groups for rank %d (all layers):"%show_rank)
+#         show_groups(tp_groups)
+#         print("DP groups for rank %d (all layers):"%show_rank)
+#         show_groups(dp_groups)
+#         # print("AllGather groups for rank %d:"%show_rank)
+#         # show_groups(allgather_groups)
+#         # print("Slice Funcs for rank %d:"%show_rank)
+#         # show_groups(slice_funcs)
+#         print('================================================================================')
+#     return pp_group, tp_groups, dp_groups, allgather_meshes, slice_meshes

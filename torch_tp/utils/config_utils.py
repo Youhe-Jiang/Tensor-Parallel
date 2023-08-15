@@ -1,4 +1,7 @@
 import json
+import os
+from .dp_utils import form_strategy
+from typing import List
 
 def str2array(s):
     return list(map(int,s.split(',')))
@@ -57,3 +60,29 @@ def read_p2p_bandwidth_config(config_path, gpu_num):
         p2p_dict[pp_deg] = env_config['pp_deg_%d'%pp_deg]
         pp_deg *= 2
     return p2p_dict
+
+def save_profiling_results(path, strategy, bsz, hidden_size, results):
+    config = read_json_config(path) if os.path.exists(path) else {}
+    key = form_strategy(strategy)
+    if key not in config.keys():
+        config[key] = {}
+    config[key]['hidden%d_bsz%d'%(hidden_size, bsz)] = results
+    write_json_config(config, path)
+    print('Already written policy profiling config into config file %s!\n'%(path)) 
+
+def save_profiled_memory(path, pp_deg, tp_deg, world_size, layer_num, bsz, rank, model_states, activation, activation_peak, cpt):
+    config = read_json_config(path) if os.path.exists(path) else {}
+    key = '%d_%d_%d'%(pp_deg,tp_deg,world_size//pp_deg//tp_deg)
+    if cpt:
+        key += '_c'
+    if key not in config.keys():
+        config[key] = {}
+    if isinstance(layer_num, List):
+        layernum_info = 'layernum[%s]'%(array2str(layer_num))
+    else:
+        layernum_info = 'layernum%d'%layer_num
+    config[key]['%s_bsz%d_rank%d_ms'%(layernum_info, bsz, rank)] = model_states
+    config[key]['%s_bsz%d_rank%d_act'%(layernum_info, bsz, rank)] = activation
+    config[key]['%s_bsz%d_rank%d_act_peak'%(layernum_info, bsz, rank)] = activation_peak
+    write_json_config(config, path)
+    print('Already written profiled memory into config file %s!\n'%(path)) 
